@@ -1,8 +1,3 @@
-#' @param proj_mod The mode of the project, which sets where the input and 
-#'   output data are stored, is either "dev" (for local development) or "prod"
-#'   (on HZI's internal network).
-#' @return Liste aller eingelesenen Blutplroben
-#' @return datum, monovette, dateiname und stadt
 read_blut <- function(bloodsamples_path){
   
   ## Alle Datein

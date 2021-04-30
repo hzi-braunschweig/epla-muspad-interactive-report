@@ -1,7 +1,3 @@
-#' @param proj_mod The mode of the project, which sets where the input and 
-#'   output data are stored, is either "dev" (for local development) or "prod"
-#'   (on HZI's internal network).
-#' @return dataset for logtaq
 read_log_pdfs <- function(logs_path){
   
   ## Alle Datein
