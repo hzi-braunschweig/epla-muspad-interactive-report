@@ -1,0 +1,731 @@
+---
+title: '`r paste0("EPLA MuSPAD ", format(Sys.time(),  "%Y-%m-%d"))`'
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(janitor)
+library(lubridate)
+library(DT)
+library(ggiraph)
+library(pdftools)
+library(readr)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(readxl)
+
+# Set paths to data files
+source("R/data-paths.R")
+
+# Load data processing functions
+source("R/LoqTaq.R")
+source("R/blutp.R")
+source("R/labResults.R")
+
+# Report theme
+theme_set(theme_light())
+my_facet_theme <- theme(strip.background = element_rect(fill = "#001540"),
+  strip.text = element_text(colour = 'white', face = "bold"),
+  legend.position = "bottom")
+
+# Load and arrange data
+tabellen <- read_log_pdfs(logs_path)
+blutproben <- read_blut(bloodsamples_path)
+laborergebnisse <- read_lab_results(labresults_path)
+
+# Colors
+vega_colors <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+  "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+
+city_vec <- sort(unique(c(blutproben$stadt, laborergebnisse$stadt)))
+city_colors <- sapply(
+  1:length(city_vec), 
+  function (i) vega_colors[1 + (i-1) %% length(vega_colors)]
+)
+names(city_colors) <- city_vec
+
+ID_format_colors <- c("correct" = vega_colors[1], "pseudonym" = vega_colors[2],
+  "comma" = vega_colors[3], "other" = vega_colors[4])
+```
+
+
+```{r}
+# Arrange data sets and annotate
+ArrangeAnnotateDataSets <- function (data_df, sampleID_name, dataset) {
+  
+  ## DEBUG
+  # data_df <- blutproben; sampleID_name <- "monovette"; dataset <- "sz"
+  
+  # Identify duplicated and count IDs and duplicated rows irrespective of file 
+  # name. N.B. for Blutporben (centers sending samples), sending date and file 
+  # name are the same, so that it doesn't make a difference to ignore the file 
+  # name.
+  data_df <- data_df %>% 
+    mutate(dataset = dataset) %>%
+    add_count_(vars = names(data_df)[names(data_df) != "dateinname"]) %>%
+    rename(data_multiplicity = n, sampleID = all_of(sampleID_name)) %>%
+    add_count(sampleID, name = "sampleID_multiplicity")
+  
+  # Correct IDs should be a string of 12 or 14 digits starting with "777" (e.g. 
+  #   "777555705610").
+  data_df <- data_df %>%
+    mutate(ID_format = case_when(
+      nchar(sampleID) %in% c(12, 14) &
+        nchar(gsub("[[:digit:]]", "", sampleID)) == 0 &
+        substr(sampleID, 1, 3) == "777" ~ "correct",
+      grepl(",", sampleID) ~ "comma", # e.g. "777090000000,00"
+      TRUE ~ "other" # e.g. "Blutproben Entnahme 17.07.2020"
+    ))
+  # Couldn't get the test for "pseudonym" (of the form: letters-"-"-numbers, e.g.
+  # "hiubz-176865718") to work in the tidyverse framework.
+  data_df$ID_format <- sapply(
+    1:nrow(data_df),
+    function(i) 
+      # print(i)
+      if (grepl("-", data_df$sampleID[i])) {
+        if (
+          nchar(gsub("[[:alpha:]]", "", 
+            str_split(data_df$sampleID[i], "-")[[1]][1])) == 0 & 
+            nchar(gsub("[[:digit:]]", "", 
+              str_split(data_df$sampleID[i], "-")[[1]][2])) == 0
+        ) {
+          "pseudonym"
+        } else {
+          data_df$ID_format[i]
+        }
+      } else {
+        data_df$ID_format[i]
+      }
+  )
+  # Suggest corrected IDs:
+  # - remove characters after "," in IDs with a comma
+  # - add leading "777" and trailing "00" to numbers in pseudonyms
+  # - adhoc suggestions
+  data_df$sampleID_corrected <- sapply(
+    1:nrow(data_df),
+    function(i) 
+      if (data_df$ID_format[i] == "correct") {
+        data_df$sampleID[i] 
+      } else if (data_df$ID_format[i] == "comma") {
+        strsplit(data_df$sampleID[i], ",")[[1]][1]
+      } else if (data_df$ID_format[i] == "pseudonym") {
+        paste0("777", strsplit(data_df$sampleID[i], "-")[[1]][2], "10")
+      } else if (data_df$sampleID[i] == "hiubz101942238") {
+        "77710194223810"
+      } else if (data_df$sampleID[i] == paste0("ezdve-1594692 ( fälschlicher ",
+        "weise statt Bioprobenetikett angebrachtes Barcode  Etikett)")) {  
+        "777159469210"
+      } else {
+        NA
+      }
+  )
+  
+  # Add row number as data point ID
+  data_df <- data_df %>% mutate(ID = as.character(row_number()))
+  
+  # Rearrange columns
+  first_columns <- c("dataset", "ID", "sampleID", "sampleID_corrected", 
+    "ID_format", "sampleID_multiplicity", "data_multiplicity", "stadt", "datum",
+    "dateinname")
+  data_df <- data_df %>% 
+    select(all_of(
+      c(first_columns, names(data_df)[!names(data_df) %in% first_columns])
+    )) %>%
+    arrange(stadt, datum)
+  
+  return(data_df)
+}
+
+blutproben_arranged <- ArrangeAnnotateDataSets(blutproben, "monovette", "sz")
+laborergebnisse_arranged <- ArrangeAnnotateDataSets(laborergebnisse, 
+  "Proben.ID", "lab")
+```
+
+```{r}
+ReplaceNAWithChar <- function (vec) {
+  vec <- sapply(vec, function (v) ifelse (is.na(v), "NA", v))
+  return(vec)
+}
+```
+
+QS / SZ
+=======================================================================
+
+Row
+-------------------------------------------------------------------------------
+
+### Tabelle
+
+```{r}
+datatable(
+  blutproben_arranged %>% 
+    mutate(across(where(is_character), ReplaceNAWithChar)) %>% 
+    mutate(across(where(is_character), as_factor)),
+  rownames = FALSE, 
+  filter = list(position = "top", clear = FALSE),
+  class = "cell-border stripe nowrap compact hover",
+  extensions = c("Scroller", "Buttons"),
+  options = list(
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel"), 
+    scrollY = 400, 
+    scroller = TRUE, 
+    fixedHeader = TRUE, 
+    deferRender = TRUE
+  )
+)
+```
+
+Row
+-------------------------------------------------------------------------------
+
+```{r}
+ID_format_sz_df <- blutproben_arranged %>% count(datum, ID_format, stadt)
+plot_ID_format_sz <- ggplot(ID_format_sz_df, aes(datum, n, fill = ID_format, color = ID_format)) +
+  # geom_bar(stat = "identity", position = "stack", width = 1) +
+  geom_bar_interactive(aes(data_id = 1:nrow(ID_format_sz_df), 
+    tooltip = paste0(stadt, "\n", ID_format, "\n", datum, "\n", n)), 
+    stat = "identity", position = "stack", width = 0.9, size = 0.1) +
+  facet_wrap(~stadt) +
+  scale_color_manual(values = ID_format_colors) +
+  scale_fill_manual(values = ID_format_colors) +
+  labs(x = "Tagesdatum", y = "Anzahl von Proben", fill = "Proben-ID-Format") +
+  theme(aspect.ratio = 9/16, plot.margin = margin(b = 2, unit = "cm"),
+    legend.position = "bottom") +
+  guides(color = FALSE)
+
+dist_ID_format_sz_df <- blutproben_arranged %>% count(ID_format, stadt)
+plot_dist_ID_format_sz <- ggplot(dist_ID_format_sz_df,
+  aes(x = ID_format, y = n, color = ID_format, fill = ID_format)) +
+  # geom_bar(stat = "identity") +
+  geom_bar_interactive(aes(data_id = 1:nrow(dist_ID_format_sz_df),
+    tooltip = paste0(stadt, "\n", ID_format, "\n", n)), 
+    stat = "identity") +
+  facet_wrap(~stadt) +
+  scale_color_manual(values = ID_format_colors) +
+  scale_fill_manual(values = ID_format_colors) +
+  labs(x = "Proben-ID-Format", y = "Anzahl von Proben", fill = "Proben-ID-Format") +
+  theme(aspect.ratio = 9/16, legend.position = "none", 
+    plot.margin = margin(b = 2, unit = "cm"))
+
+dist_ID_multiplicity_sz_df <- blutproben_arranged %>%
+  select(sampleID, sampleID_multiplicity, stadt) %>%
+  unique() %>%
+  count(sampleID_multiplicity, stadt)
+plot_dist_ID_multiplicity_sz <- ggplot(dist_ID_multiplicity_sz_df,
+  aes(x = sampleID_multiplicity, y = n)) +
+  geom_bar_interactive(aes(data_id = 1:nrow(dist_ID_multiplicity_sz_df), 
+    tooltip = paste0(stadt, "\n", "Multi. ", sampleID_multiplicity, 
+      "\n", "Anzahl ", n)), 
+    stat = "identity", color = "black", fill = "lightgrey") +
+  facet_wrap(~stadt) +
+  scale_x_continuous(breaks = 1:max(blutproben_arranged$sampleID_multiplicity)) +
+  labs(x = "ID-Multiplizität", y = "Anzahl von Proben") +
+  theme(aspect.ratio = 9/16, plot.margin = margin(b = 2, unit = "cm"))
+
+dist_data_multiplicity_sz_df <- blutproben_arranged %>%
+  select(-ID, -dateinname) %>%
+  unique() %>%
+  count(stadt, data_multiplicity)
+plot_dist_data_multiplicity_sz <- ggplot(dist_data_multiplicity_sz_df,
+  aes(x = data_multiplicity, y = n)) +
+  geom_bar_interactive(aes(data_id = 1:nrow(dist_data_multiplicity_sz_df), 
+    tooltip = paste0(stadt, "\n", "Multi. ", data_multiplicity, 
+      "\n", "Anzahl ", n)),
+    stat = "identity", color = "black", fill = "lightgrey") +
+  facet_wrap(~stadt) +
+  scale_x_continuous(breaks = 1:max(blutproben_arranged$data_multiplicity)) +  
+  labs(x = "Daten-Multiplizität", y = "Anzahl von Proben") +
+  theme(aspect.ratio = 9/16, plot.margin = margin(b = 2, unit = "cm"))
+```
+
+### Versendete Proben nach Zeit und Stadt (SZ)
+
+```{r}
+ggiraph(code = {print(plot_ID_format_sz)}, hover_css = "fill:#F8B71C")
+```
+
+### Versendete Proben nach Stadt (SZ)
+
+```{r}
+ggiraph(code = {print(plot_dist_ID_format_sz)}, hover_css = "fill:#F8B71C")
+```
+
+Row
+-------------------------------------------------------------------------------
+
+### Wie oft kommen einzelne Proben-IDs vor? (SZ)
+
+```{r}
+ggiraph(code = {print(plot_dist_ID_multiplicity_sz)}, hover_css = "fill:#F8B71C")
+```
+
+### Wie oft kommen einzelne Datenpunkte vor? (SZ)
+
+```{r}
+ggiraph(code = {print(plot_dist_data_multiplicity_sz)}, hover_css = "fill:#F8B71C")
+```
+
+QS / Lab
+=======================================================================
+
+Row
+-------------------------------------------------------------------------------
+
+### Tabelle
+
+```{r}
+datatable(
+  laborergebnisse_arranged %>% 
+    mutate(across(where(is_character), ReplaceNAWithChar)) %>% 
+    mutate(across(where(is_character), as_factor)),
+  rownames = FALSE, 
+  filter = list(position = "top", clear = FALSE),
+  class = "cell-border stripe nowrap compact hover",
+  extensions = c("Scroller", "Buttons"),
+  options = list(
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel"), 
+    scrollY = 400, 
+    scroller = TRUE, 
+    fixedHeader = TRUE, 
+    deferRender = TRUE
+  )
+)
+```
+
+Row {data-height 600}
+-------------------------------------------------------------------------------
+
+```{r}
+ID_format_lab_df <- laborergebnisse_arranged %>% count(datum, ID_format, stadt)
+plot_ID_format_lab <- ggplot(ID_format_lab_df, aes(datum, n, fill = ID_format, color = ID_format)) +
+  # geom_bar(stat = "identity", position = "stack", width = 1) +
+  geom_bar_interactive(aes(data_id = 1:nrow(ID_format_lab_df), 
+    tooltip = paste0(stadt, "\n", ID_format, "\n", datum, "\n", n)), 
+    stat = "identity", position = "stack", width = 0.9, size = 0.1) +
+  facet_wrap(~stadt) +
+  scale_color_manual(values = ID_format_colors) +
+  scale_fill_manual(values = ID_format_colors) +
+  labs(x = "Tagesdatum", y = "Anzahl von Proben", fill = "Proben-ID-Format") +
+  theme(aspect.ratio = 9/16, plot.margin = margin(b = 2, unit = "cm"),
+    legend.position = "bottom") +
+  guides(color = FALSE)
+
+dist_ID_format_lab_df <- laborergebnisse_arranged %>% count(ID_format, stadt)
+plot_dist_ID_format_lab <- ggplot(dist_ID_format_lab_df,
+  aes(x = ID_format, y = n, color = ID_format, fill = ID_format)) +
+  # geom_bar(stat = "identity") +
+  geom_bar_interactive(aes(data_id = 1:nrow(dist_ID_format_lab_df),
+    tooltip = paste0(stadt, "\n", ID_format, "\n", n)), 
+    stat = "identity") +
+  facet_wrap(~stadt) +
+  scale_color_manual(values = ID_format_colors) +
+  scale_fill_manual(values = ID_format_colors) +
+  labs(x = "Proben-ID-Format", y = "Anzahl von Proben", fill = "Proben-ID-Format") +
+  theme(aspect.ratio = 9/16, legend.position = "none", 
+    plot.margin = margin(b = 2, unit = "cm"))
+
+dist_ID_multiplicity_lab_df <- laborergebnisse_arranged %>%
+  select(sampleID, sampleID_multiplicity, stadt) %>%
+  unique() %>%
+  count(sampleID_multiplicity, stadt)
+plot_dist_ID_multiplicity_lab <- ggplot(dist_ID_multiplicity_lab_df,
+  aes(x = sampleID_multiplicity, y = n)) +
+  geom_bar_interactive(aes(data_id = 1:nrow(dist_ID_multiplicity_lab_df), 
+    tooltip = paste0(stadt, "\n", "Multi. ", sampleID_multiplicity, 
+      "\n", "Anzahl ", n)), 
+    stat = "identity", color = "black", fill = "lightgrey") +
+  facet_wrap(~stadt) +
+  scale_x_continuous(breaks = 1:max(laborergebnisse_arranged$sampleID_multiplicity)) +
+  labs(x = "ID-Multiplizität", y = "Anzahl von Proben") +
+  theme(aspect.ratio = 9/16, plot.margin = margin(b = 2, unit = "cm"))
+
+dist_data_multiplicity_lab_df <- laborergebnisse_arranged %>%
+  select(-ID, -dateinname) %>%
+  unique() %>%
+  count(stadt, data_multiplicity)
+plot_dist_data_multiplicity_lab <- ggplot(dist_data_multiplicity_lab_df,
+  aes(x = data_multiplicity, y = n)) +
+  geom_bar_interactive(aes(data_id = 1:nrow(dist_data_multiplicity_lab_df), 
+    tooltip = paste0(stadt, "\n", "Multi. ", data_multiplicity, 
+      "\n", "Anzahl ", n)),
+    stat = "identity", color = "black", fill = "lightgrey") +
+  facet_wrap(~stadt) +
+  scale_x_continuous(breaks = 1:max(laborergebnisse_arranged$data_multiplicity)) +  
+  labs(x = "Daten-Multiplizität", y = "Anzahl von Proben") +
+  theme(aspect.ratio = 9/16, plot.margin = margin(b = 2, unit = "cm"))
+
+qual_rate_lab_df <- laborergebnisse_arranged %>%
+  add_count(stadt, datum, name = "daily_sample_number") %>%
+  count(stadt, datum, daily_sample_number, Ergebnis..qualitativ.,
+    name = "daily_qual_results") %>%
+  complete(nesting(stadt, datum, daily_sample_number), Ergebnis..qualitativ., 
+    fill = list(daily_qual_results = 0)) %>%
+  mutate(rate = daily_qual_results / daily_sample_number) %>%
+  arrange(stadt, datum)
+plot_qual_rate_lab <- ggplot(qual_rate_lab_df, aes(x = datum, y = rate, 
+  color = Ergebnis..qualitativ.)) +
+  geom_line() +
+  geom_point_interactive(aes(data_id = 1:nrow(qual_rate_lab_df),
+    tooltip = paste0(stadt, "\n", datum, "\n", Ergebnis..qualitativ., "\n",
+      signif(rate, digits = 2))), 
+    shape = 1, size = 1) +
+  facet_wrap(~stadt) +
+  scale_y_log10() +
+  scale_color_manual(values = vega_colors) +
+  labs(x = "Tagesdatum", y = "Rate", color = "Ergebniss") +
+  theme(legend.position = "bottom", aspect.ratio = 9/16, 
+    plot.margin = margin(b = 2, unit = "cm"), panel.grid.minor = element_blank())
+```
+
+### Analysierte Proben nach Zeit und Stadt (Lab)
+
+```{r}
+ggiraph(code = {print(plot_ID_format_lab)}, hover_css = "fill:#F8B71C")
+```
+
+### Analysierte Proben nach Stadt (Lab)
+
+```{r}
+ggiraph(code = {print(plot_dist_ID_format_lab)}, hover_css = "fill:#F8B71C")
+```
+
+Row
+-------------------------------------------------------------------------------
+
+### Wie oft kommen einzelne Proben-IDs vor? (Lab)
+
+```{r}
+ggiraph(code = {print(plot_dist_ID_multiplicity_lab)}, 
+  hover_css = "fill:#F8B71C")
+```
+
+### Wie oft kommen einzelne Datenpunkte vor? (Lab)
+
+```{r}
+ggiraph(code = {print(plot_dist_data_multiplicity_lab)}, 
+  hover_css = "fill:#F8B71C")
+```
+
+Row
+-------------------------------------------------------------------------------
+
+### Raten von qualitativen Ergebnissen nach Zeit und Stadt (Lab)
+
+```{r}
+ggiraph(code = {print(plot_qual_rate_lab)}, hover_css = "fill:#F8B71C")
+```
+
+###
+
+QS / SZ+Lab (Proben-IDs)
+=======================================================================
+
+```{r}
+first_columns_mergedsampleID <- c("sampleID", "ID_format", "matched", 
+  "sampleID_multiplicity", "data_multiplicity",
+  "sampleID_corrected.sz", "sampleID_corrected.lab", 
+  "sampleID_multiplicity.sz", "sampleID_multiplicity.lab", 
+  "data_multiplicity.sz", "data_multiplicity.lab", 
+  "stadt.sz", "stadt.lab", "datum.sz", "datum.lab", "dataset.sz", "dataset.lab",
+  "ID.sz", "ID.lab", "dateinname.sz", "dateinname.lab")
+merged_datasets_sampleID <- full_join(
+  blutproben_arranged,
+  laborergebnisse_arranged,
+  by = c("sampleID", "ID_format"),
+  suffix = c(".sz", ".lab")
+) %>%
+  mutate(matched = !is.na(dataset.sz) & !is.na(dataset.lab))
+merged_datasets_sampleID <- merged_datasets_sampleID %>%
+  add_count_(vars = names(merged_datasets_sampleID)[
+    !names(merged_datasets_sampleID) %in% 
+      c("dateinname.sz", "dateinname.lab", "ID.sz", "ID.lab")
+  ]) %>%
+  rename(data_multiplicity = n) %>%
+  add_count(sampleID, name = "sampleID_multiplicity") %>%
+  select(all_of(c(
+    first_columns_mergedsampleID, 
+    names(merged_datasets_sampleID)[
+      !names(merged_datasets_sampleID) %in% first_columns_mergedsampleID
+    ]
+  )))
+```
+
+Row
+-------------------------------------------------------------------------------
+
+### Tabelle
+
+```{r}
+datatable(
+  merged_datasets_sampleID %>% 
+    mutate(across(where(is_character), ReplaceNAWithChar)) %>% 
+    mutate(across(where(is_character), as_factor)),
+  rownames = FALSE, 
+  filter = list(position = "top", clear = FALSE),
+  class = "cell-border stripe nowrap compact hover",
+  extensions = c("Scroller", "Buttons"),
+  options = list(
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel"), 
+    scrollY = 400, 
+    scroller = TRUE, 
+    fixedHeader = TRUE, 
+    deferRender = TRUE
+  )
+)
+```
+
+Row
+-------------------------------------------------------------------------------
+
+```{r}
+datum_sampleID_df <- merged_datasets_sampleID %>% 
+  filter(matched) %>% 
+  count(datum.sz, datum.lab, stadt.sz)
+scatterplot_datum_sampleID <- ggplot(datum_sampleID_df, aes(datum.sz, datum.lab,
+  size = n, fill = stadt.sz)) +
+  geom_abline() +
+  geom_point_interactive(aes(data_id = 1:nrow(datum_sampleID_df),
+    tooltip = paste0(stadt.sz, "\n", "Versandd. ", datum.sz, "\n", 
+      "Analysed. ", datum.lab, "\n", "Probenanz. ", n)), shape = 21, 
+    color = "black", alpha = 0.5) +
+  scale_fill_manual(values = city_colors) +
+  labs(x = "Versand-Datum", y = "Analyse-Datum", size = "Proben-Anzahl", 
+    fill = "Stadt (SZ)") +
+  theme(legend.position = "right",
+    plot.margin = margin(b = 2, unit = "cm"))  
+```
+
+### Vergleich Versand- und Analyse-Daten für gematchte Proben (über Proben-IDs)
+
+```{r}
+ggiraph(code = {print(scatterplot_datum_sampleID)}, hover_css = "fill:#F8B71C")
+```
+
+###
+
+QS / SZ+Lab (korr. Proben-IDs)
+=======================================================================
+
+```{r}
+first_columns_mergedsampleID_corrected <- c("sampleID_corrected", "matched",
+  "sampleID_corrected_multiplicity", "data_multiplicity",
+  "sampleID.sz", "ID_format.sz", "sampleID.lab", "ID_format.lab", 
+  "sampleID_multiplicity.sz", "sampleID_multiplicity.lab", 
+  "data_multiplicity.sz", "data_multiplicity.lab", 
+  "stadt.sz", "stadt.lab", "datum.sz", "datum.lab", "dataset.sz", "dataset.lab",
+  "ID.sz", "ID.lab", "dateinname.sz", "dateinname.lab")
+merged_datasets_sampleID_corrected <- full_join(
+  blutproben_arranged,
+  laborergebnisse_arranged,
+  by = c("sampleID_corrected"),
+  suffix = c(".sz", ".lab")
+) %>%
+  mutate(matched = !is.na(dataset.sz) & !is.na(dataset.lab))
+merged_datasets_sampleID_corrected <- merged_datasets_sampleID_corrected %>%
+  add_count_(vars = names(merged_datasets_sampleID_corrected)[
+    !names(merged_datasets_sampleID_corrected) %in% 
+      c("dateinname.sz", "dateinname.lab", "ID.sz", "ID.lab")
+  ]) %>%
+  rename(data_multiplicity = n) %>%
+  add_count(sampleID_corrected, name = "sampleID_corrected_multiplicity") %>%
+  select(all_of(c(
+    first_columns_mergedsampleID_corrected, 
+    names(merged_datasets_sampleID_corrected)[
+      !names(merged_datasets_sampleID_corrected) %in% 
+        first_columns_mergedsampleID_corrected
+    ]
+  )))
+```
+
+Row
+-------------------------------------------------------------------------------
+
+### Tabelle
+
+```{r}
+datatable(
+  merged_datasets_sampleID_corrected %>% 
+    mutate(across(where(is_character), ReplaceNAWithChar)) %>% 
+    mutate(across(where(is_character), as_factor)),
+  rownames = FALSE, 
+  filter = list(position = "top", clear = FALSE),
+  class = "cell-border stripe nowrap compact hover",
+  extensions = c("Scroller", "Buttons"),
+  options = list(
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel"), 
+    scrollY = 400, 
+    scroller = TRUE, 
+    fixedHeader = TRUE, 
+    deferRender = TRUE
+  )
+)
+```
+
+Row
+-------------------------------------------------------------------------------
+
+```{r}
+datum_sampleID_corrected_df <- merged_datasets_sampleID_corrected %>% 
+  filter(matched) %>% 
+  count(datum.sz, datum.lab, stadt.sz)
+scatterplot_datum_sampleID_corrected <- ggplot(datum_sampleID_corrected_df, 
+  aes(datum.sz, datum.lab,size = n, fill = stadt.sz)) +
+  geom_abline() +
+  geom_point_interactive(aes(data_id = 1:nrow(datum_sampleID_corrected_df),
+    tooltip = paste0(stadt.sz, "\n", "Versandd. ", datum.sz, "\n", 
+      "Analysed. ", datum.lab, "\n", "Probenanz. ", n)), shape = 21, 
+    color = "black", alpha = 0.5) +
+  scale_fill_manual(values = city_colors) +
+  labs(x = "Versand-Datum", y = "Analyse-Datum", size = "Proben-Anzahl", 
+    fill = "Stadt (SZ)") +
+  theme(legend.position = "right",
+    plot.margin = margin(b = 2, unit = "cm"))  
+```
+
+### Vergleich Versand- und Analyse-Daten für gematchte Proben (über Proben-IDs)
+
+```{r}
+ggiraph(code = {print(scatterplot_datum_sampleID_corrected)}, 
+  hover_css = "fill:#F8B71C")
+```
+
+###
+
+LoqTaq
+=======================================================================
+
+Column {.tabset .tabset-fade}
+-----------------------------------------------------------------------
+
+### Freiburg
+
+```{r}
+frei_data <- tabellen %>% 
+  filter(stadt == "Freiburg") %>% 
+  arrange(datum, index) %>% 
+  mutate(ind = case_when(nchar(file) < 2 ~ paste0("0", as.character(file)),
+    TRUE ~ as.character(file))) %>% 
+  mutate(file = paste0("Datei: ", ind))
+
+if (nrow(frei_data) > 0) {
+  frei_data %>% 
+    ggplot(aes(index, celsius, group = file_id)) +
+    geom_line() +
+    facet_wrap(~start_date) + 
+    my_facet_theme  
+}
+
+```
+
+### Reutlingen
+
+```{r}
+tabellen %>% 
+  filter(stadt == "Reutlingen") %>% 
+  arrange(datum, index) %>% 
+  mutate(ind = case_when(nchar(file) < 2 ~ paste0("0", as.character(file)),
+    TRUE ~ as.character(file))) %>% 
+  mutate(file = paste0("Datei: ", ind)) %>% 
+  ggplot(aes(index, celsius, group = file_id)) +
+  geom_line() +
+  facet_wrap(~start_date) +
+  my_facet_theme
+```
+
+
+Column {.tabset .tabset-fade}
+-----------------------------------------------------------------------
+
+### Freiburg
+
+```{r}
+tabellen %>% 
+  filter(stadt == "Freiburg") %>%  
+  group_by(file_id, start_date) %>% 
+  summarise(avg = mean(celsius),
+    min = min(celsius),
+    max = max(celsius)) %>% 
+  knitr::kable("html") %>% 
+  kableExtra::kable_styling("striped", full_width = FALSE)
+```
+
+
+### Reutlingen
+
+```{r}
+tabellen %>% 
+  filter(stadt == "Reutlingen") %>%  
+  group_by(file_id, start_date) %>% 
+  summarise(avg = mean(celsius),
+    min = min(celsius),
+    max = max(celsius)) %>% 
+  knitr::kable("html") %>% 
+  kableExtra::kable_styling("striped", full_width = FALSE)
+```
+
+
+
+Blutprobenlisten
+=======================================================================
+
+Column
+-----------------------------------------------------------------------
+
+### Anzahl Blutproben
+
+```{r}
+count_bp <- blutproben %>% 
+  count(monovette)
+valueBox(nrow(count_bp), icon = "fa-pencil")
+```
+
+### Anzahl der Duplikate
+
+```{r}
+n_dups <- count_bp %>% 
+  filter(n > 1) %>% 
+  nrow() 
+valueBox(n_dups, icon = "fa-pencil", color = "danger")
+```
+
+
+Column {.tabset .tabset-fade}
+-----------------------------------------------------------------------
+
+### Freiburg
+
+```{r}
+blutproben %>% 
+  filter(stadt == "Freiburg") %>% 
+  add_count(monovette) %>% 
+  filter(n > 1) %>% 
+  select(-n) %>% 
+  knitr::kable("html") %>% 
+  kableExtra::kable_styling("striped", full_width = FALSE)
+```
+
+
+### Reutlingen
+
+```{r}
+blutproben %>% 
+  filter(stadt == "Reutlingen") %>% 
+  add_count(monovette) %>% 
+  filter(n > 1) %>% 
+  select(-n) %>% 
+  knitr::kable("html") %>% 
+  kableExtra::kable_styling("striped", full_width = FALSE)
+```
+
