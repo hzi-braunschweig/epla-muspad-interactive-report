@@ -13,7 +13,7 @@ read_lab_results <- function(labresults_path){
       "/Laborergebnisse Original CSV 2020/",
       c(
         "4_Reutlingen 2/Nachtrag Reutlingen 2 20202511.csv",
-        "5_Osnabrück/Nachtrag Osnabrück 1 20202511.csv",
+        "5_Osnabrueck/Nachtrag Osnabrueck 1 20202511.csv",
         "6_Magdeburg/Magdeburg 1 Erste Ergebnisse.csv",
         "7_Freiburg 2/Freiburg 2 Erste Ergebnisse.csv"
       )
@@ -23,9 +23,9 @@ read_lab_results <- function(labresults_path){
   ## Lesen
   # N.B. the quantitative results have sometimes non-numeric values such as
   # "<3,80", thus all variables are set to character.
-  daten <- purrr::map(datein, read.csv2, header = TRUE, 
+  daten <- purrr::map(datein, read.csv2, header = TRUE,
     colClasses = "character", na.strings = c("", NA))
-
+  
   data_raw <- NULL
   for (i in seq_along(daten)) {
     # After visual inspection: skip 1 row after header (the option `skip` of

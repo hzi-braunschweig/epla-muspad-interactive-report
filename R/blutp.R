@@ -85,7 +85,7 @@ read_blut <- function(bloodsamples_path){
         stringr::str_sub(-10) %>%
         lubridate::dmy()
     }
-    index_stadt <- which(strsplit(datein[i], "/")[[1]] == "Blutprobenlisten") + 1
+    index_stadt <- which(strsplit(datein[i], "/")[[1]] == "01_Blutprobenlisten") + 1
     stadt <- strsplit(datein[i], "/")[[1]][index_stadt]
     
     data_raw[[i]] <- daten[[i]] %>% 
